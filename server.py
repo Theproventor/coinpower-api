@@ -1,9 +1,9 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import psycopg2
-import psycopg2.extras
+import pg8000.native
 import os
 import json
+from urllib.parse import urlparse
 
 app = Flask(__name__)
 CORS(app, origins="*")
@@ -12,32 +12,41 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "JanusUrbanus@e1097")
 
 def get_db():
-    return psycopg2.connect(DATABASE_URL)
+    u = urlparse(DATABASE_URL)
+    return pg8000.native.Connection(
+        host=u.hostname,
+        port=u.port or 5432,
+        user=u.username,
+        password=u.password,
+        database=u.path.lstrip("/"),
+        ssl_context=True,
+    )
 
 def init_db():
     conn = get_db()
-    cur = conn.cursor()
-    cur.execute("CREATE TABLE IF NOT EXISTS articles (id SERIAL PRIMARY KEY, title TEXT NOT NULL, cat TEXT DEFAULT 'MARKT', excerpt TEXT, content TEXT, img TEXT, date TEXT, created_at TIMESTAMP DEFAULT NOW())")
-    cur.execute("CREATE TABLE IF NOT EXISTS products (id SERIAL PRIMARY KEY, name TEXT NOT NULL, description TEXT, price NUMERIC(10,2), img TEXT, cat TEXT, created_at TIMESTAMP DEFAULT NOW())")
-    cur.execute("CREATE TABLE IF NOT EXISTS orders (id SERIAL PRIMARY KEY, name TEXT, email TEXT, coin TEXT, items JSONB, total NUMERIC(10,2), status TEXT DEFAULT 'pending', created_at TIMESTAMP DEFAULT NOW())")
-    cur.execute("CREATE TABLE IF NOT EXISTS signal (id SERIAL PRIMARY KEY, signal TEXT DEFAULT 'BULLISH', description TEXT, updated_at TIMESTAMP DEFAULT NOW())")
-    conn.commit()
-    cur.close()
+    conn.run("CREATE TABLE IF NOT EXISTS articles (id SERIAL PRIMARY KEY, title TEXT NOT NULL, cat TEXT DEFAULT 'MARKT', excerpt TEXT, content TEXT, img TEXT, date TEXT, created_at TIMESTAMP DEFAULT NOW())")
+    conn.run("CREATE TABLE IF NOT EXISTS products (id SERIAL PRIMARY KEY, name TEXT NOT NULL, description TEXT, price NUMERIC(10,2), img TEXT, cat TEXT, created_at TIMESTAMP DEFAULT NOW())")
+    conn.run("CREATE TABLE IF NOT EXISTS orders (id SERIAL PRIMARY KEY, name TEXT, email TEXT, coin TEXT, items JSONB, total NUMERIC(10,2), status TEXT DEFAULT 'pending', created_at TIMESTAMP DEFAULT NOW())")
+    conn.run("CREATE TABLE IF NOT EXISTS signal (id SERIAL PRIMARY KEY, signal TEXT DEFAULT 'BULLISH', description TEXT, updated_at TIMESTAMP DEFAULT NOW())")
     conn.close()
 
 @app.route('/')
 def health():
     return jsonify({'status': 'ok'})
 
+def rows_as_dicts(conn, results):
+    """Convert pg8000 row tuples to dicts using column metadata."""
+    cols = [c["name"] for c in conn.columns]
+    return [dict(zip(cols, row)) for row in results]
+
 @app.route('/articles', methods=['GET'])
 def get_articles():
     try:
-        limit = request.args.get('limit', 50)
+        limit = int(request.args.get('limit', 50))
         conn = get_db()
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("SELECT * FROM articles ORDER BY created_at DESC LIMIT %s", (limit,))
-        rows = [dict(r) for r in cur.fetchall()]
-        cur.close(); conn.close()
+        results = conn.run("SELECT * FROM articles ORDER BY created_at DESC LIMIT :limit", limit=limit)
+        rows = rows_as_dicts(conn, results)
+        conn.close()
         return jsonify(rows)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -46,11 +55,10 @@ def get_articles():
 def get_article(aid):
     try:
         conn = get_db()
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("SELECT * FROM articles WHERE id=%s", (aid,))
-        row = cur.fetchone()
-        cur.close(); conn.close()
-        return jsonify(dict(row)) if row else (jsonify({'error':'not found'}), 404)
+        results = conn.run("SELECT * FROM articles WHERE id=:aid", aid=aid)
+        rows = rows_as_dicts(conn, results)
+        conn.close()
+        return jsonify(rows[0]) if rows else (jsonify({'error': 'not found'}), 404)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -59,11 +67,13 @@ def create_article():
     try:
         d = request.json
         conn = get_db()
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("INSERT INTO articles (title,cat,excerpt,content,img,date) VALUES (%s,%s,%s,%s,%s,%s) RETURNING *",
-            (d.get('title'),d.get('cat','MARKT'),d.get('excerpt'),d.get('content'),d.get('img'),d.get('date')))
-        row = dict(cur.fetchone())
-        conn.commit(); cur.close(); conn.close()
+        results = conn.run(
+            "INSERT INTO articles (title,cat,excerpt,content,img,date) VALUES (:title,:cat,:excerpt,:content,:img,:date) RETURNING *",
+            title=d.get('title'), cat=d.get('cat', 'MARKT'), excerpt=d.get('excerpt'),
+            content=d.get('content'), img=d.get('img'), date=d.get('date')
+        )
+        row = rows_as_dicts(conn, results)[0]
+        conn.close()
         return jsonify(row), 201
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -72,9 +82,8 @@ def create_article():
 def delete_article(aid):
     try:
         conn = get_db()
-        cur = conn.cursor()
-        cur.execute("DELETE FROM articles WHERE id=%s", (aid,))
-        conn.commit(); cur.close(); conn.close()
+        conn.run("DELETE FROM articles WHERE id=:aid", aid=aid)
+        conn.close()
         return jsonify({'deleted': True})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -83,10 +92,9 @@ def delete_article(aid):
 def get_products():
     try:
         conn = get_db()
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("SELECT * FROM products ORDER BY created_at DESC")
-        rows = [dict(r) for r in cur.fetchall()]
-        cur.close(); conn.close()
+        results = conn.run("SELECT * FROM products ORDER BY created_at DESC")
+        rows = rows_as_dicts(conn, results)
+        conn.close()
         return jsonify(rows)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -96,11 +104,13 @@ def create_product():
     try:
         d = request.json
         conn = get_db()
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("INSERT INTO products (name,description,price,img,cat) VALUES (%s,%s,%s,%s,%s) RETURNING *",
-            (d.get('name'),d.get('description'),d.get('price'),d.get('img'),d.get('cat')))
-        row = dict(cur.fetchone())
-        conn.commit(); cur.close(); conn.close()
+        results = conn.run(
+            "INSERT INTO products (name,description,price,img,cat) VALUES (:name,:description,:price,:img,:cat) RETURNING *",
+            name=d.get('name'), description=d.get('description'), price=d.get('price'),
+            img=d.get('img'), cat=d.get('cat')
+        )
+        row = rows_as_dicts(conn, results)[0]
+        conn.close()
         return jsonify(row), 201
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -109,9 +119,8 @@ def create_product():
 def delete_product(pid):
     try:
         conn = get_db()
-        cur = conn.cursor()
-        cur.execute("DELETE FROM products WHERE id=%s", (pid,))
-        conn.commit(); cur.close(); conn.close()
+        conn.run("DELETE FROM products WHERE id=:pid", pid=pid)
+        conn.close()
         return jsonify({'deleted': True})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -120,10 +129,9 @@ def delete_product(pid):
 def get_orders():
     try:
         conn = get_db()
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("SELECT * FROM orders ORDER BY created_at DESC")
-        rows = [dict(r) for r in cur.fetchall()]
-        cur.close(); conn.close()
+        results = conn.run("SELECT * FROM orders ORDER BY created_at DESC")
+        rows = rows_as_dicts(conn, results)
+        conn.close()
         return jsonify(rows)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -133,11 +141,13 @@ def create_order():
     try:
         d = request.json
         conn = get_db()
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("INSERT INTO orders (name,email,coin,items,total) VALUES (%s,%s,%s,%s,%s) RETURNING *",
-            (d.get('name'),d.get('email'),d.get('coin'),json.dumps(d.get('items',[])),d.get('total')))
-        row = dict(cur.fetchone())
-        conn.commit(); cur.close(); conn.close()
+        results = conn.run(
+            "INSERT INTO orders (name,email,coin,items,total) VALUES (:name,:email,:coin,:items,:total) RETURNING *",
+            name=d.get('name'), email=d.get('email'), coin=d.get('coin'),
+            items=json.dumps(d.get('items', [])), total=d.get('total')
+        )
+        row = rows_as_dicts(conn, results)[0]
+        conn.close()
         return jsonify(row), 201
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -146,25 +156,25 @@ def create_order():
 def get_signal():
     try:
         conn = get_db()
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("SELECT * FROM signal ORDER BY updated_at DESC LIMIT 1")
-        row = cur.fetchone()
-        cur.close(); conn.close()
-        return jsonify(dict(row)) if row else jsonify({'signal':'BULLISH','description':''})
+        results = conn.run("SELECT * FROM signal ORDER BY updated_at DESC LIMIT 1")
+        rows = rows_as_dicts(conn, results)
+        conn.close()
+        return jsonify(rows[0]) if rows else jsonify({'signal': 'BULLISH', 'description': ''})
     except:
-        return jsonify({'signal':'BULLISH','description':''})
+        return jsonify({'signal': 'BULLISH', 'description': ''})
 
 @app.route('/signal', methods=['POST'])
 def update_signal():
     try:
         d = request.json
         conn = get_db()
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("DELETE FROM signal")
-        cur.execute("INSERT INTO signal (signal,description) VALUES (%s,%s) RETURNING *",
-            (d.get('signal','BULLISH'),d.get('description','')))
-        row = dict(cur.fetchone())
-        conn.commit(); cur.close(); conn.close()
+        conn.run("DELETE FROM signal")
+        results = conn.run(
+            "INSERT INTO signal (signal,description) VALUES (:signal,:description) RETURNING *",
+            signal=d.get('signal', 'BULLISH'), description=d.get('description', '')
+        )
+        row = rows_as_dicts(conn, results)[0]
+        conn.close()
         return jsonify(row)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
