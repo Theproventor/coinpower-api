@@ -187,6 +187,16 @@ def admin_login():
     return jsonify({'error':'Wrong password'}), 401
 
 if __name__ == '__main__':
-    init_db()
+    # Initialize database if DATABASE_URL is set
+    if DATABASE_URL:
+        try:
+            init_db()
+            print("Database initialized successfully")
+        except Exception as e:
+            print(f"Warning: Database initialization failed: {e}")
+            print("App will continue running, but database operations may fail")
+    else:
+        print("Warning: DATABASE_URL not set. Database operations will fail.")
+
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
